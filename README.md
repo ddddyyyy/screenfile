@@ -35,6 +35,14 @@ python -m pip install numpy opencv-python-headless
 
 ## 用法
 
+### 命令总览
+
+```bash
+python -m screenfile encode <input_file> <output_video> [options]
+python -m screenfile decode <input_video> <output_file>
+python -m screenfile estimate <input_file> [options]
+```
+
 ### 1. 把文件编码成视频
 
 ```bash
@@ -47,26 +55,164 @@ python -m screenfile encode ./input.bin ./transfer.mp4
 python -m screenfile encode ./input.bin ./transfer.mp4 \
   --chunk-size 640 \
   --repeat 3 \
-  --fps 8
+  --fps 8 \
+  --compression zstd
 ```
 
-参数说明：
-- `--chunk-size`：每个分片的原始字节数。更小更稳，但视频更长。
-- `--repeat`：整轮重复播放次数。更大更稳，但视频更长。
-- `--fps`：写出视频帧率。建议保守使用 `6-12`。
+默认行为：
+- 先打印当前压缩方案的预计大小和预计时长
+- 再询问你是否继续生成视频
+
+如果你要跳过确认，直接生成：
+
+```bash
+python -m screenfile encode ./input.bin ./transfer.mp4 --yes
+```
+
+#### `encode` 入参说明
+
+`encode` 必填参数：
+
+- `input_file`
+  - 含义：要编码成视频的源文件路径
+  - 默认值：无，必填
+- `output_video`
+  - 含义：输出视频路径
+  - 默认值：无，必填
+  - 推荐：优先试 `.avi`，当前通常比 `.mp4` 更稳
+
+`encode` 可选参数：
+
+- `--chunk-size`
+  - 含义：每个视频数据分片携带的 payload 字节数
+  - 默认值：`640`
+  - 推荐范围：`640` 到 `896`
+  - 推荐起点：`768`
+  - 使用建议：
+    - `640`：更稳，视频更长
+    - `768`：通常是比较好的平衡点
+    - `896`：更激进，视频更短，但更容易拍屏失败
+    - `1024+`：更偏实验参数，不建议一开始就用
+
+- `--repeat`
+  - 含义：整轮分片重复播放的次数
+  - 默认值：`3`
+  - 推荐范围：`2` 到 `3`
+  - 推荐起点：`2`
+  - 使用建议：
+    - `3`：更稳，但时长直接乘 3
+    - `2`：通常能明显缩短时长，适合拍摄条件较好时
+    - `1`：仅适合非常理想的测试环境，不建议默认使用
+
+- `--fps`
+  - 含义：输出视频帧率
+  - 默认值：`8`
+  - 推荐范围：`6` 到 `12`
+  - 推荐起点：`8`
+  - 使用建议：
+    - `6`：更保守，更稳
+    - `8`：默认平衡值
+    - `10`：想进一步缩短时长时可试
+    - `12`：偏激进，拍屏环境不好时更容易掉帧或模糊
+
+- `--compression`
+  - 含义：视频分片前先对原文件做的预压缩算法
+  - 默认值：`zstd`
+  - 可选值：`none`、`gzip`、`zstd`
+  - 推荐值：`zstd`
+  - 使用建议：
+    - `zstd`：首选。压缩率和速度通常最均衡
+    - `gzip`：兼容型备选，通常不如 `zstd`
+    - `none`：仅在文件本身已高度压缩、或你想做最原始对比时使用
+
+- `-y` / `--yes`
+  - 含义：跳过“先评估再确认”的交互步骤，直接生成视频
+  - 默认值：关闭
+  - 推荐：脚本化调用或批处理时开启；手动调参时关闭
+
+#### `encode` 推荐配置
+
+按拍摄稳定性从稳到快，大致可以这样用：
+
+- 稳妥首选
+  - `--chunk-size 640 --repeat 3 --fps 8 --compression zstd`
+- 推荐平衡值
+  - `--chunk-size 768 --repeat 2 --fps 8 --compression zstd`
+- 偏激进缩时长
+  - `--chunk-size 896 --repeat 2 --fps 10 --compression zstd`
 
 编码时会输出：
+- 压缩算法
 - 原文件大小
+- 压缩后大小
+- 压缩率
 - 分片数量
+- 总帧数
 - 重复轮数
 - 预计视频时长
 - 播放建议
+
+### 3. 先做参数评估
+
+如果你想在真正生成视频前先对比 `none/gzip/zstd` 三种模式的预计效果：
+
+```bash
+python -m screenfile estimate ./input.bin
+```
+
+也可以带参数一起估算：
+
+```bash
+python -m screenfile estimate ./input.bin \
+  --chunk-size 768 \
+  --repeat 2 \
+  --fps 10
+```
+
+#### `estimate` 入参说明
+
+- `input_file`
+  - 含义：待评估的源文件路径
+  - 默认值：无，必填
+
+- `--chunk-size`
+  - 含义：用于估算的视频分片大小
+  - 默认值：`640`
+  - 推荐范围：`640` 到 `896`
+
+- `--repeat`
+  - 含义：用于估算的重复轮数
+  - 默认值：`3`
+  - 推荐范围：`2` 到 `3`
+
+- `--fps`
+  - 含义：用于估算的目标视频帧率
+  - 默认值：`8`
+  - 推荐范围：`6` 到 `12`
+
+它会分别输出每种压缩模式下的：
+- 原文件大小
+- 压缩后大小
+- 压缩率
+- 分片数
+- 总帧数
+- 预计视频时长
 
 ### 2. 从录下来的视频恢复文件
 
 ```bash
 python -m screenfile decode ./transfer.mp4 ./restored.bin
 ```
+
+#### `decode` 入参说明
+
+- `input_video`
+  - 含义：录制得到的视频文件
+  - 默认值：无，必填
+
+- `output_file`
+  - 含义：恢复出的目标文件路径
+  - 默认值：无，必填
 
 解码时会输出：
 - 已恢复的唯一分片数
@@ -100,6 +246,27 @@ python scripts/demo_roundtrip.py ./demo-output \
   --repeat 3 \
   --fps 8
 ```
+
+#### `demo_roundtrip.py` 入参说明
+
+- `output_dir`
+  - 含义：演示文件输出目录
+  - 默认值：`demo-output`
+
+- `--payload-size`
+  - 含义：自动生成的演示源文件大小
+  - 默认值：`65536`
+  - 推荐范围：`32768` 到 `262144`
+
+- `--repeat`
+  - 含义：演示视频使用的重复轮数
+  - 默认值：`3`
+  - 推荐范围：`2` 到 `3`
+
+- `--fps`
+  - 含义：演示视频使用的帧率
+  - 默认值：`8`
+  - 推荐范围：`6` 到 `10`
 
 ## 打包成可执行程序
 
@@ -246,6 +413,15 @@ dist\screenfile.exe
 5. 还原数据包并校验 CRC
 6. 按分片序号去重
 7. 分片收齐后重组并校验 SHA-256
+
+在进入视频分片前，当前版本会先把原始文件包装成一个传输 payload，其中包含：
+- 原始文件名
+- 原始文件大小
+- 原始文件 SHA-256
+- 压缩算法标记
+- 压缩后的字节流
+
+这样接收端在视频解码完成后可以自动解压并恢复原始文件内容。
 
 ## 推荐拍摄方式
 

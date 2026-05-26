@@ -32,6 +32,6 @@ def run_demo_roundtrip(
     restored_path = output_dir / "demo-restored.bin"
 
     source_path.write_bytes(build_demo_payload(payload_size))
-    encode_file_to_video(source_path, video_path, repeat=repeat, fps=fps)
+    encode_file_to_video(source_path, video_path, repeat=repeat, fps=fps, skip_confirmation=True)
     decode_video_to_file(video_path, restored_path)
     return DemoResult(source_path=source_path, video_path=video_path, restored_path=restored_path)

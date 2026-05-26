@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 
 class ChunkingTests(unittest.TestCase):
@@ -34,6 +37,39 @@ class ChunkingTests(unittest.TestCase):
 
         self.assertTrue(session.is_complete)
         self.assertEqual(session.assemble_bytes(), payload)
+
+
+class PayloadCodecTests(unittest.TestCase):
+    def test_transport_payload_round_trip_with_zstd(self) -> None:
+        from screenfile.payload_codec import decode_transport_payload, encode_transport_payload
+
+        original = (b"hello payload " * 1000)[:12000]
+        encoded = encode_transport_payload("sample.bin", original, compression="zstd")
+        decoded = decode_transport_payload(encoded)
+
+        self.assertEqual(decoded.compression, "zstd")
+        self.assertEqual(decoded.original_name, "sample.bin")
+        self.assertEqual(decoded.original_bytes, original)
+        self.assertLess(decoded.encoded_size, len(original))
+
+    def test_transport_payload_round_trip_with_gzip(self) -> None:
+        from screenfile.payload_codec import decode_transport_payload, encode_transport_payload
+
+        original = (b"gzip payload " * 1000)[:12000]
+        encoded = encode_transport_payload("sample.bin", original, compression="gzip")
+        decoded = decode_transport_payload(encoded)
+
+        self.assertEqual(decoded.compression, "gzip")
+        self.assertEqual(decoded.original_bytes, original)
+
+    def test_legacy_payload_without_wrapper_passes_through(self) -> None:
+        from screenfile.payload_codec import decode_transport_payload
+
+        original = b"legacy-binary"
+        decoded = decode_transport_payload(original)
+
+        self.assertEqual(decoded.compression, "none")
+        self.assertEqual(decoded.original_bytes, original)
 
 
 class FrameCodecTests(unittest.TestCase):
@@ -148,10 +184,85 @@ class VideoPipelineTests(unittest.TestCase):
             restored = tmp / "restored.bin"
             source.write_bytes(payload)
 
-            encode_file_to_video(source, video)
+            encode_file_to_video(source, video, skip_confirmation=True)
             decode_video_to_file(video, restored)
 
             self.assertEqual(restored.read_bytes(), payload)
+
+    def test_encode_prints_compression_summary(self) -> None:
+        from screenfile.cli import encode_file_to_video
+
+        payload = (b"compress-me-" * 4000)[:1024 * 64]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            source = tmp / "source.bin"
+            video = tmp / "transfer.mp4"
+            source.write_bytes(payload)
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                encode_file_to_video(source, video, compression="zstd", skip_confirmation=True)
+
+            text = output.getvalue()
+            self.assertIn("Compression: zstd", text)
+            self.assertIn("Original bytes:", text)
+            self.assertIn("Encoded bytes:", text)
+            self.assertIn("Estimated duration:", text)
+
+    def test_estimate_prints_all_compression_profiles(self) -> None:
+        from screenfile.cli import print_estimates
+
+        payload = (b"estimate-me-" * 4000)[:1024 * 64]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            source = tmp / "source.bin"
+            source.write_bytes(payload)
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                print_estimates(source, chunk_size=640, repeat=3, fps=8)
+
+            text = output.getvalue()
+            self.assertIn("Compression: none", text)
+            self.assertIn("Compression: gzip", text)
+            self.assertIn("Compression: zstd", text)
+            self.assertIn("Estimated duration:", text)
+            self.assertIn("Frames:", text)
+
+    def test_encode_prompts_before_generating_by_default(self) -> None:
+        from screenfile.cli import encode_file_to_video
+
+        payload = (b"confirm-me-" * 4000)[:1024 * 32]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            source = tmp / "source.bin"
+            video = tmp / "transfer.mp4"
+            source.write_bytes(payload)
+
+            output = io.StringIO()
+            with patch("builtins.input", return_value="n"), redirect_stdout(output):
+                encode_file_to_video(source, video)
+
+            self.assertFalse(video.exists())
+            self.assertIn("Proceed with video generation?", output.getvalue())
+
+    def test_encode_can_skip_confirmation(self) -> None:
+        from screenfile.cli import encode_file_to_video
+
+        payload = (b"skip-confirm-" * 4000)[:1024 * 32]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            source = tmp / "source.bin"
+            video = tmp / "transfer.mp4"
+            source.write_bytes(payload)
+
+            encode_file_to_video(source, video, skip_confirmation=True)
+
+            self.assertTrue(video.exists())
 
     def test_decoder_reports_missing_chunks_when_frames_are_dropped(self) -> None:
         import cv2
@@ -169,7 +280,7 @@ class VideoPipelineTests(unittest.TestCase):
             restored = tmp / "restored.bin"
             source.write_bytes(payload)
 
-            encode_file_to_video(source, full_video, repeat=1, fps=6)
+            encode_file_to_video(source, full_video, repeat=1, fps=6, compression="none", skip_confirmation=True)
             frames = list(read_video_frames(full_video))
             trimmed = frames[::2]
             write_video(lossy_video, trimmed, fps=6, frame_size=(frames[0].shape[1], frames[0].shape[0]))

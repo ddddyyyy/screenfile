@@ -3,6 +3,7 @@
 __all__ = [
     "chunking",
     "frame_codec",
+    "payload_codec",
     "recovery",
     "video_io",
 ]
