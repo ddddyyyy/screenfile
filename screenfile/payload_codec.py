@@ -7,8 +7,15 @@ from dataclasses import dataclass
 
 try:
     import compression.zstd as zstd
+    _ZSTD_BACKEND = "stdlib"
 except ImportError:  # pragma: no cover
     zstd = None
+    try:
+        import zstandard as zstd_fallback
+        _ZSTD_BACKEND = "zstandard"
+    except ImportError:  # pragma: no cover
+        zstd_fallback = None
+        _ZSTD_BACKEND = None
 
 TRANSPORT_MAGIC = b"SFP1"
 TRANSPORT_HEADER = struct.Struct(">4sBBQH32s")
@@ -30,9 +37,13 @@ def _compress(payload: bytes, compression: str) -> bytes:
     if compression == "gzip":
         return gzip.compress(payload, compresslevel=9)
     if compression == "zstd":
-        if zstd is None:
+        if _ZSTD_BACKEND == "stdlib":
+            return zstd.compress(payload, level=10)
+        if _ZSTD_BACKEND == "zstandard":
+            compressor = zstd_fallback.ZstdCompressor(level=10)
+            return compressor.compress(payload)
+        if _ZSTD_BACKEND is None:
             raise RuntimeError("zstd compression is unavailable in this Python runtime")
-        return zstd.compress(payload, level=10)
     raise ValueError(f"Unsupported compression: {compression}")
 
 
@@ -42,9 +53,13 @@ def _decompress(payload: bytes, compression: str) -> bytes:
     if compression == "gzip":
         return gzip.decompress(payload)
     if compression == "zstd":
-        if zstd is None:
+        if _ZSTD_BACKEND == "stdlib":
+            return zstd.decompress(payload)
+        if _ZSTD_BACKEND == "zstandard":
+            decompressor = zstd_fallback.ZstdDecompressor()
+            return decompressor.decompress(payload)
+        if _ZSTD_BACKEND is None:
             raise RuntimeError("zstd decompression is unavailable in this Python runtime")
-        return zstd.decompress(payload)
     raise ValueError(f"Unsupported compression: {compression}")
 
 
