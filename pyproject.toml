@@ -1,6 +1,6 @@
 [project]
 name = "screenfile"
-version = "0.1.0"
+version = "0.2.2"
 description = "Encode files into screen-recordable videos and recover them from recordings."
 requires-python = ">=3.10"
 dependencies = [

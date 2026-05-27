@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import struct
 import zlib
+from dataclasses import dataclass
 from typing import Literal
 
 import cv2
 import numpy as np
 
+from screenfile import __version__
 from screenfile.chunking import Packet, packet_from_bytes
 
 FRAME_WIDTH = 1920
@@ -20,6 +22,15 @@ CELL_SIZE = 8
 DATA_SIZE = GRID_SIZE * CELL_SIZE
 FRAME_HEADER = struct.Struct(">HI")
 MAX_PACKET_BYTES = (GRID_SIZE * GRID_SIZE // 8) - FRAME_HEADER.size
+PROTOCOL_LABEL = "layout=v1"
+
+
+@dataclass(frozen=True)
+class FrameInspection:
+    packet: Packet | None
+    status: Literal["ok", "no-quad", "frame-crc", "packet-invalid"]
+    square: np.ndarray | None = None
+    binary: np.ndarray | None = None
 
 
 def _packet_to_bits(packet_bytes: bytes) -> np.ndarray:
@@ -48,6 +59,35 @@ def _draw_marker(canvas: np.ndarray, x: int, y: int) -> None:
     cv2.rectangle(canvas, (x + 24, y + 24), (x + MARKER_SIZE - 24, y + MARKER_SIZE - 24), (0, 0, 0), -1)
 
 
+def _draw_corner_label(
+    frame: np.ndarray,
+    text: str,
+    *,
+    anchor: tuple[int, int],
+    align: Literal["left", "right"],
+) -> None:
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.78
+    thickness = 2
+    padding_x = 14
+    padding_y = 10
+    (text_width, text_height), baseline = cv2.getTextSize(text, font, scale, thickness)
+    anchor_x, anchor_y = anchor
+    if align == "left":
+        box_left = anchor_x
+        text_x = box_left + padding_x
+    else:
+        box_left = anchor_x - (text_width + padding_x * 2)
+        text_x = box_left + padding_x
+    box_top = anchor_y
+    box_right = box_left + text_width + padding_x * 2
+    box_bottom = box_top + text_height + padding_y * 2 + baseline
+    cv2.rectangle(frame, (box_left, box_top), (box_right, box_bottom), (255, 255, 255), -1)
+    cv2.rectangle(frame, (box_left, box_top), (box_right, box_bottom), (0, 0, 0), 2)
+    text_y = box_top + padding_y + text_height
+    cv2.putText(frame, text, (text_x, text_y), font, scale, (0, 0, 0), thickness, cv2.LINE_AA)
+
+
 def encode_packet_frame(packet: Packet) -> np.ndarray:
     frame = np.full((FRAME_HEIGHT, FRAME_WIDTH, 3), 255, dtype=np.uint8)
     square = np.full((CODE_SQUARE, CODE_SQUARE, 3), 255, dtype=np.uint8)
@@ -69,8 +109,10 @@ def encode_packet_frame(packet: Packet) -> np.ndarray:
     start_y = (FRAME_HEIGHT - CODE_SQUARE) // 2
     frame[start_y : start_y + CODE_SQUARE, start_x : start_x + CODE_SQUARE] = square
 
-    label = f"chunk {packet.chunk_index + 1}/{packet.total_chunks}"
-    cv2.putText(frame, label, (80, FRAME_HEIGHT - 90), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 0, 0), 3, cv2.LINE_AA)
+    version_label = f"screenfile {__version__} {PROTOCOL_LABEL}"
+    chunk_label = f"chunk {packet.chunk_index + 1}/{packet.total_chunks}"
+    _draw_corner_label(frame, version_label, anchor=(36, 18), align="left")
+    _draw_corner_label(frame, chunk_label, anchor=(FRAME_WIDTH - 36, 18), align="right")
     return frame
 
 
@@ -85,30 +127,8 @@ def _order_points(points: np.ndarray) -> np.ndarray:
     return rect
 
 
-def _extract_square(frame: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        raise ValueError("No contour found")
-
-    best_quad: np.ndarray | None = None
-    best_area = 0.0
-    for contour in contours:
-        perimeter = cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
-        if len(approx) != 4:
-            continue
-        area = cv2.contourArea(approx)
-        if area > best_area:
-            best_area = area
-            best_quad = approx.reshape(4, 2).astype(np.float32)
-
-    if best_quad is None:
-        raise ValueError("No quadrilateral contour found")
-
-    ordered = _order_points(best_quad)
+def _warp_quad(frame: np.ndarray, quad: np.ndarray) -> np.ndarray:
+    ordered = _order_points(quad)
     destination = np.array(
         [
             [0, 0],
@@ -122,11 +142,89 @@ def _extract_square(frame: np.ndarray) -> np.ndarray:
     return cv2.warpPerspective(frame, matrix, (CODE_SQUARE, CODE_SQUARE), borderValue=(255, 255, 255))
 
 
-def decode_frame_with_status(frame: np.ndarray) -> tuple[Packet | None, Literal["ok", "no-quad", "frame-crc", "packet-invalid"]]:
+def _quad_square_score(quad: np.ndarray) -> float:
+    _, (width, height), _ = cv2.minAreaRect(quad.astype(np.float32))
+    if width <= 0 or height <= 0:
+        return 0.0
+    return min(width, height) / max(width, height)
+
+
+def _score_warped_square(square: np.ndarray, *, area_ratio: float, square_score: float) -> float:
+    gray = cv2.cvtColor(square, cv2.COLOR_BGR2GRAY)
+    band = max(8, CODE_SQUARE // 36)
+    border_mask = np.zeros(gray.shape, dtype=bool)
+    border_mask[:band, :] = True
+    border_mask[-band:, :] = True
+    border_mask[:, :band] = True
+    border_mask[:, -band:] = True
+
+    border_mean = float(gray[border_mask].mean())
+    center = gray[CODE_SQUARE // 4 : (CODE_SQUARE * 3) // 4, CODE_SQUARE // 4 : (CODE_SQUARE * 3) // 4]
+    center_mean = float(center.mean())
+    contrast = max(center_mean - border_mean, 0.0) / 255.0
+    border_darkness = (255.0 - border_mean) / 255.0
+    center_brightness = center_mean / 255.0
+    return (
+        square_score * 3.0
+        + border_darkness * 2.0
+        + center_brightness * 1.0
+        + contrast * 1.5
+        + area_ratio * 0.35
+    )
+
+
+def _candidate_quads(mask: np.ndarray) -> list[np.ndarray]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    candidates: list[np.ndarray] = []
+    for contour in contours:
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter <= 0:
+            continue
+        approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
+        if len(approx) == 4:
+            candidates.append(approx.reshape(4, 2).astype(np.float32))
+    return candidates
+
+
+def _extract_square(frame: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    edges = cv2.Canny(blurred, 50, 150)
+    edges = cv2.dilate(edges, np.ones((3, 3), dtype=np.uint8), iterations=1)
+    candidates = _candidate_quads(binary) + _candidate_quads(edges)
+    if not candidates:
+        raise ValueError("No contour found")
+
+    frame_area = float(frame.shape[0] * frame.shape[1])
+    best_square: np.ndarray | None = None
+    best_score = float("-inf")
+
+    for quad in candidates:
+        area = cv2.contourArea(quad)
+        if area < frame_area * 0.01:
+            continue
+
+        square_score = _quad_square_score(quad)
+        if square_score < 0.72:
+            continue
+
+        warped = _warp_quad(frame, quad)
+        score = _score_warped_square(warped, area_ratio=area / frame_area, square_score=square_score)
+        if score > best_score:
+            best_score = score
+            best_square = warped
+
+    if best_square is None:
+        raise ValueError("No quadrilateral contour found")
+    return best_square
+
+
+def inspect_frame(frame: np.ndarray) -> FrameInspection:
     try:
         square = _extract_square(frame)
     except ValueError:
-        return None, "no-quad"
+        return FrameInspection(packet=None, status="no-quad")
 
     gray = cv2.cvtColor(square, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -140,13 +238,18 @@ def decode_frame_with_status(frame: np.ndarray) -> tuple[Packet | None, Literal[
     except ValueError as exc:
         message = str(exc)
         if "CRC" in message:
-            return None, "frame-crc"
-        return None, "packet-invalid"
+            return FrameInspection(packet=None, status="frame-crc", square=square, binary=binary)
+        return FrameInspection(packet=None, status="packet-invalid", square=square, binary=binary)
 
     try:
-        return packet_from_bytes(packet_bytes), "ok"
+        return FrameInspection(packet=packet_from_bytes(packet_bytes), status="ok", square=square, binary=binary)
     except ValueError:
-        return None, "packet-invalid"
+        return FrameInspection(packet=None, status="packet-invalid", square=square, binary=binary)
+
+
+def decode_frame_with_status(frame: np.ndarray) -> tuple[Packet | None, Literal["ok", "no-quad", "frame-crc", "packet-invalid"]]:
+    inspection = inspect_frame(frame)
+    return inspection.packet, inspection.status
 
 
 def decode_frame(frame: np.ndarray) -> Packet | None:

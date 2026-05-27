@@ -62,6 +62,7 @@ python -m screenfile encode ./input.bin ./transfer.mp4 \
 默认行为：
 - 先打印当前压缩方案的预计大小和预计时长
 - 再询问你是否继续生成视频
+- 每一帧左上角会显示 `screenfile` 版本号和布局标识，右上角会显示缩小后的 `chunk x/y`
 
 如果你要跳过确认，直接生成：
 
@@ -130,6 +131,17 @@ python -m screenfile encode ./input.bin ./transfer.mp4 --yes
   - 默认值：关闭
   - 推荐：脚本化调用或批处理时开启；手动调参时关闭
 
+帧内辅助标记：
+
+- 左上角
+  - 内容：`screenfile <version> layout=v1`
+  - 作用：方便确认编码器版本和帧布局是否一致
+- 右上角
+  - 内容：`chunk x/y`
+  - 作用：方便肉眼定位当前分片进度
+- 布局原则
+  - 这两块信息都放在码框外侧留白区，默认不会压到主体码区
+
 #### `encode` 推荐配置
 
 按拍摄稳定性从稳到快，大致可以这样用：
@@ -144,12 +156,15 @@ python -m screenfile encode ./input.bin ./transfer.mp4 --yes
 编码时会输出：
 - 压缩算法
 - 原文件大小
+  - 显示格式示例：`12.11 KB (12,397 B)`
 - 压缩后大小
+  - 显示格式示例：`5.08 KB (5,209 B)`
 - 压缩率
 - 分片数量
 - 总帧数
 - 重复轮数
 - 预计视频时长
+- 预计视频大小
 - 播放建议
 
 ### 3. 先做参数评估
@@ -197,11 +212,23 @@ python -m screenfile estimate ./input.bin \
 - 分片数
 - 总帧数
 - 预计视频时长
+- 预计视频大小
+
+关于“预计视频大小”：
+- 会基于当前编码器先生成一个很小的采样视频，再按总帧数折算
+- 默认按更适合阅读的单位显示：`MB` 或 `GB`
+- `encode` 会按你的实际输出后缀来估算；`estimate` 当前按 `.mp4` 口径估算
 
 ### 2. 从录下来的视频恢复文件
 
 ```bash
 python -m screenfile decode ./transfer.mp4 ./restored.bin
+```
+
+也可以查看当前程序版本：
+
+```bash
+python -m screenfile --version
 ```
 
 #### `decode` 入参说明
