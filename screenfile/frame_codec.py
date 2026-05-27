@@ -7,6 +7,7 @@ from typing import Literal
 
 import cv2
 import numpy as np
+from reedsolo import ReedSolomonError, RSCodec
 
 from screenfile import __version__
 from screenfile.chunking import Packet, packet_from_bytes
@@ -21,8 +22,14 @@ GRID_SIZE = 96
 CELL_SIZE = 8
 DATA_SIZE = GRID_SIZE * CELL_SIZE
 FRAME_HEADER = struct.Struct(">HI")
-MAX_PACKET_BYTES = (GRID_SIZE * GRID_SIZE // 8) - FRAME_HEADER.size
+FRAME_RS_BYTES = 32
+FRAME_RS_DATA_BYTES = 223
+FRAME_RS_BLOCK_BYTES = FRAME_RS_DATA_BYTES + FRAME_RS_BYTES
+FRAME_CAPACITY_BYTES = (GRID_SIZE * GRID_SIZE // 8) - FRAME_HEADER.size
+MAX_RS_BLOCKS = FRAME_CAPACITY_BYTES // FRAME_RS_BLOCK_BYTES
+MAX_PACKET_BYTES = FRAME_RS_DATA_BYTES * MAX_RS_BLOCKS
 PROTOCOL_LABEL = "layout=v1"
+FRAME_RS_CODEC = RSCodec(FRAME_RS_BYTES)
 
 
 @dataclass(frozen=True)
@@ -37,7 +44,13 @@ def _packet_to_bits(packet_bytes: bytes) -> np.ndarray:
     if len(packet_bytes) > MAX_PACKET_BYTES:
         raise ValueError(f"Packet too large for one frame: {len(packet_bytes)} > {MAX_PACKET_BYTES}")
 
-    encoded = FRAME_HEADER.pack(len(packet_bytes), zlib.crc32(packet_bytes) & 0xFFFFFFFF) + packet_bytes
+    encoded_blocks = []
+    for start in range(0, len(packet_bytes), FRAME_RS_DATA_BYTES):
+        block = packet_bytes[start : start + FRAME_RS_DATA_BYTES]
+        padded = block + bytes(FRAME_RS_DATA_BYTES - len(block))
+        encoded_blocks.append(bytes(FRAME_RS_CODEC.encode(padded)))
+    encoded_payload = b"".join(encoded_blocks)
+    encoded = FRAME_HEADER.pack(len(packet_bytes), zlib.crc32(packet_bytes) & 0xFFFFFFFF) + encoded_payload
     padded = encoded + bytes((GRID_SIZE * GRID_SIZE // 8) - len(encoded))
     return np.unpackbits(np.frombuffer(padded, dtype=np.uint8))
 
@@ -47,7 +60,25 @@ def _bits_to_packet(bits: np.ndarray) -> bytes:
     packet_size, packet_crc = FRAME_HEADER.unpack(raw[: FRAME_HEADER.size])
     if packet_size <= 0 or packet_size > MAX_PACKET_BYTES:
         raise ValueError("Decoded packet size is invalid")
-    packet_bytes = raw[FRAME_HEADER.size : FRAME_HEADER.size + packet_size]
+    block_count = (packet_size + FRAME_RS_DATA_BYTES - 1) // FRAME_RS_DATA_BYTES
+    rs_size = block_count * FRAME_RS_BLOCK_BYTES
+    rs_payload = raw[FRAME_HEADER.size : FRAME_HEADER.size + rs_size]
+    if len(rs_payload) == rs_size:
+        decoded_blocks = []
+        try:
+            for index in range(block_count):
+                start = index * FRAME_RS_BLOCK_BYTES
+                block = rs_payload[start : start + FRAME_RS_BLOCK_BYTES]
+                decoded = FRAME_RS_CODEC.decode(block)
+                decoded_blocks.append(bytes(decoded[0] if isinstance(decoded, tuple) else decoded))
+            packet_bytes = b"".join(decoded_blocks)[:packet_size]
+        except ReedSolomonError:
+            packet_bytes = raw[FRAME_HEADER.size : FRAME_HEADER.size + packet_size]
+    else:
+        packet_bytes = raw[FRAME_HEADER.size : FRAME_HEADER.size + packet_size]
+
+    if len(packet_bytes) != packet_size:
+        raise ValueError("Decoded packet size is invalid")
     if zlib.crc32(packet_bytes) & 0xFFFFFFFF != packet_crc:
         raise ValueError("Frame CRC mismatch")
     return packet_bytes
@@ -220,31 +251,93 @@ def _extract_square(frame: np.ndarray) -> np.ndarray:
     return best_square
 
 
+def _cell_bits_from_binary(binary: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    start = (CODE_SQUARE - DATA_SIZE) // 2
+    data_region = binary[start : start + DATA_SIZE, start : start + DATA_SIZE]
+    cells = data_region.reshape(GRID_SIZE, CELL_SIZE, GRID_SIZE, CELL_SIZE).mean(axis=(1, 3))
+    bits = (cells < 127).astype(np.uint8).reshape(-1)
+    return bits, cells
+
+
+def _binary_variants(square: np.ndarray) -> list[np.ndarray]:
+    gray = cv2.cvtColor(square, cv2.COLOR_BGR2GRAY)
+
+    variants: list[np.ndarray] = []
+
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variants.append(otsu)
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    _, clahe_otsu = cv2.threshold(clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variants.append(clahe_otsu)
+
+    background = cv2.GaussianBlur(gray, (0, 0), sigmaX=31, sigmaY=31)
+    normalized = cv2.divide(gray, background, scale=255)
+    normalized = cv2.normalize(normalized, None, 0, 255, cv2.NORM_MINMAX)
+    _, normalized_otsu = cv2.threshold(normalized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    variants.append(normalized_otsu)
+
+    adaptive = cv2.adaptiveThreshold(
+        clahe,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        7,
+    )
+    variants.append(adaptive)
+
+    combined = cv2.bitwise_and(clahe_otsu, adaptive)
+    variants.append(combined)
+
+    unique_variants: list[np.ndarray] = []
+    seen = set()
+    for variant in variants:
+        key = variant.tobytes()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_variants.append(variant)
+    return unique_variants
+
+
+def inspect_square(square: np.ndarray) -> FrameInspection:
+    best_failure: FrameInspection | None = None
+    best_failure_score = float("-inf")
+
+    for binary in _binary_variants(square):
+        bits, cells = _cell_bits_from_binary(binary)
+        confidence = float(np.abs(cells - 127).mean())
+
+        try:
+            packet_bytes = _bits_to_packet(bits)
+        except ValueError as exc:
+            message = str(exc)
+            status: Literal["frame-crc", "packet-invalid"] = "frame-crc" if "CRC" in message else "packet-invalid"
+            score = confidence + (1000.0 if status == "frame-crc" else 0.0)
+            if score > best_failure_score:
+                best_failure_score = score
+                best_failure = FrameInspection(packet=None, status=status, square=square, binary=binary)
+            continue
+
+        try:
+            return FrameInspection(packet=packet_from_bytes(packet_bytes), status="ok", square=square, binary=binary)
+        except ValueError:
+            if confidence > best_failure_score:
+                best_failure_score = confidence
+                best_failure = FrameInspection(packet=None, status="packet-invalid", square=square, binary=binary)
+
+    if best_failure is not None:
+        return best_failure
+    return FrameInspection(packet=None, status="packet-invalid", square=square)
+
+
 def inspect_frame(frame: np.ndarray) -> FrameInspection:
     try:
         square = _extract_square(frame)
     except ValueError:
         return FrameInspection(packet=None, status="no-quad")
-
-    gray = cv2.cvtColor(square, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    start = (CODE_SQUARE - DATA_SIZE) // 2
-    data_region = binary[start : start + DATA_SIZE, start : start + DATA_SIZE]
-    cells = data_region.reshape(GRID_SIZE, CELL_SIZE, GRID_SIZE, CELL_SIZE).mean(axis=(1, 3))
-    bits = (cells < 127).astype(np.uint8).reshape(-1)
-
-    try:
-        packet_bytes = _bits_to_packet(bits)
-    except ValueError as exc:
-        message = str(exc)
-        if "CRC" in message:
-            return FrameInspection(packet=None, status="frame-crc", square=square, binary=binary)
-        return FrameInspection(packet=None, status="packet-invalid", square=square, binary=binary)
-
-    try:
-        return FrameInspection(packet=packet_from_bytes(packet_bytes), status="ok", square=square, binary=binary)
-    except ValueError:
-        return FrameInspection(packet=None, status="packet-invalid", square=square, binary=binary)
+    return inspect_square(square)
 
 
 def decode_frame_with_status(frame: np.ndarray) -> tuple[Packet | None, Literal["ok", "no-quad", "frame-crc", "packet-invalid"]]:

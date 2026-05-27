@@ -60,11 +60,26 @@ jobs:
     needs: build
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download packaged artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      - name: Build release notes from tag annotation
+        shell: bash
+        run: |
+          git fetch --tags --force
+          notes="$(git for-each-ref --format='%(contents)' "refs/tags/${GITHUB_REF_NAME}")"
+          if [ -z "$notes" ]; then
+            notes="Release ${GITHUB_REF_NAME}"
+          fi
+          printf '%s\n' "$notes" > release-notes.md
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
@@ -74,4 +89,4 @@ jobs:
             dist/screenfile-macos.zip
             dist/screenfile-windows-x64.zip
           fail_on_unmatched_files: true
-          generate_release_notes: true
+          body_path: release-notes.md

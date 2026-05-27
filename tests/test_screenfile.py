@@ -189,6 +189,31 @@ class FrameCodecTests(unittest.TestCase):
         self.assertIsNotNone(restored)
         self.assertEqual(restored.to_bytes(), packet.to_bytes())
 
+    def test_decoder_handles_localized_glare(self) -> None:
+        import cv2
+        import numpy as np
+
+        from screenfile.chunking import build_packets_from_bytes
+        from screenfile.frame_codec import decode_frame, encode_packet_frame
+
+        packet = build_packets_from_bytes("glare.bin", b"payload" * 90, chunk_size=480)[0]
+        frame = encode_packet_frame(packet).astype(np.float32)
+
+        glare = np.zeros(frame.shape[:2], dtype=np.float32)
+        cv2.circle(glare, (620, 390), 105, 1.0, -1)
+        glare = cv2.GaussianBlur(glare, (0, 0), sigmaX=42, sigmaY=42)
+        glare = np.clip(glare * 120, 0, 120)
+
+        degraded = frame.copy()
+        degraded[:, :, 1] = np.clip(degraded[:, :, 1] + glare, 0, 255)
+        degraded[:, :, 2] = np.clip(degraded[:, :, 2] + glare, 0, 255)
+        degraded = degraded * (1.0 - glare[..., None] / 255.0 * 0.28) + 255.0 * (glare[..., None] / 255.0 * 0.28)
+        degraded = np.clip(degraded, 0, 255).astype(np.uint8)
+
+        restored = decode_frame(degraded)
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored.to_bytes(), packet.to_bytes())
+
     def test_decoder_handles_rotated_embedded_frame(self) -> None:
         import cv2
         import numpy as np
@@ -319,6 +344,33 @@ class VideoPipelineTests(unittest.TestCase):
             self.assertIn("Estimated duration:", text)
             self.assertIn("Frames:", text)
             self.assertRegex(text, r"Estimated video size: [0-9.]+ (MB|GB)")
+
+    def test_estimated_video_size_stays_reasonably_close_to_actual_output(self) -> None:
+        from screenfile.cli import _estimate_for_compression, encode_file_to_video
+
+        payload = (b"estimate-video-size-" * 12000)[:1024 * 192]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            source = tmp / "source.bin"
+            video = tmp / "transfer.mp4"
+            source.write_bytes(payload)
+
+            summary = _estimate_for_compression(
+                source,
+                chunk_size=640,
+                repeat=3,
+                fps=8,
+                compression="none",
+                output_suffix=".mp4",
+            )
+            encode_file_to_video(source, video, chunk_size=640, repeat=3, fps=8, compression="none", skip_confirmation=True)
+
+            estimated = int(summary["estimated_video_size_bytes"])
+            actual = video.stat().st_size
+            ratio = actual / max(1, estimated)
+            self.assertGreater(ratio, 0.5)
+            self.assertLess(ratio, 1.8)
 
     def test_encode_prompts_before_generating_by_default(self) -> None:
         from screenfile.cli import encode_file_to_video

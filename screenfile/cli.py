@@ -42,18 +42,40 @@ def _format_storage_size_with_bytes(num_bytes: int) -> str:
     return f"{_format_storage_size(num_bytes)} ({num_bytes:,} B)"
 
 
-def _estimate_video_size_bytes(*, sample_frame, total_frames: int, fps: int, suffix: str) -> int:
-    sample_frames = max(1, min(total_frames, 6))
+def _build_estimate_sample_frames(packets, *, repeat: int, max_sample_frames: int = 24) -> list:
+    total_frames = len(packets) * repeat
+    sample_frames = max(1, min(total_frames, max_sample_frames))
+    if total_frames <= sample_frames:
+        indices = list(range(total_frames))
+    else:
+        indices = []
+        for position in range(sample_frames):
+            index = round(position * (total_frames - 1) / (sample_frames - 1))
+            if not indices or index != indices[-1]:
+                indices.append(index)
+
+    frames = []
+    packet_count = len(packets)
+    for index in indices:
+        packet = packets[index % packet_count]
+        frames.append(encode_packet_frame(packet))
+    return frames
+
+
+def _estimate_video_size_bytes(*, sample_frames: list, total_frames: int, fps: int, suffix: str) -> int:
+    if not sample_frames:
+        raise ValueError("At least one sample frame is required")
+
     with tempfile.TemporaryDirectory() as tmpdir:
         probe_path = Path(tmpdir) / f"estimate{suffix}"
         write_video(
             probe_path,
-            (sample_frame.copy() for _ in range(sample_frames)),
+            (frame.copy() for frame in sample_frames),
             fps=fps,
             frame_size=(FRAME_WIDTH, FRAME_HEIGHT),
         )
         probe_size = probe_path.stat().st_size
-    estimated = int(round(probe_size * (total_frames / sample_frames)))
+    estimated = int(round(probe_size * (total_frames / len(sample_frames))))
     return max(estimated, probe_size)
 
 
@@ -70,9 +92,9 @@ def _estimate_for_compression(
     transport_payload = encode_transport_payload(input_file.name, original_bytes, compression=compression)
     packets = build_packets_from_bytes(input_file.name, transport_payload, chunk_size=chunk_size)
     frames = len(packets) * repeat
-    sample_frame = encode_packet_frame(packets[0])
+    sample_frames = _build_estimate_sample_frames(packets, repeat=repeat)
     estimated_video_size = _estimate_video_size_bytes(
-        sample_frame=sample_frame,
+        sample_frames=sample_frames,
         total_frames=frames,
         fps=fps,
         suffix=output_suffix,
@@ -216,6 +238,7 @@ def decode_video_to_file(
         total_frames += 1
         inspection = inspect_frame(frame)
         packet, status = inspection.packet, inspection.status
+
         if status != "ok":
             if status == "frame-crc":
                 frame_crc_failures += 1
