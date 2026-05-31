@@ -4,9 +4,9 @@
 
 它的设计目标不是“视频播放”，而是“视觉数据传输”：
 - 发送端把文件切片成数据包
-- 每个数据包渲染成高对比度黑白帧
+- 每个数据包渲染成高对比度视觉帧，支持黑白矩阵和 4 色彩色模式
 - 每帧现在带有 Reed-Solomon 帧级纠错，能更好地抵抗拍屏时的局部误码
-- 接收端从录屏或拍屏视频中逐帧识别、去重、重组
+- 接收端从录屏或拍屏视频中自动识别码区、透视校正、逐帧识别、去重、投票恢复、重组
 - 只有校验通过才写回最终文件
 
 首版重点是“恢复成功率优先”，尤其针对“手机拍另一台显示器”的场景。
@@ -57,7 +57,8 @@ python -m screenfile encode ./input.bin ./transfer.mp4 \
   --chunk-size 640 \
   --repeat 3 \
   --fps 8 \
-  --compression zstd
+  --compression zstd \
+  --mode matrix
 ```
 
 默认行为：
@@ -88,13 +89,15 @@ python -m screenfile encode ./input.bin ./transfer.mp4 --yes
 - `--chunk-size`
   - 含义：每个视频数据分片携带的 payload 字节数
   - 默认值：`640`
-  - 推荐范围：`640` 到 `896`
-  - 推荐起点：`768`
+  - 当前上限：`1032`
+  - 推荐范围：`512` 到 `768`
+  - 推荐起点：`640`
   - 使用建议：
-    - `640`：更稳，视频更长
-    - `768`：通常是比较好的平衡点
-    - `896`：更激进，视频更短，但更容易拍屏失败
-    - `1024+`：更偏实验参数，不建议一开始就用
+    - `512`：更稳，适合手机拍屏排查
+    - `640`：默认平衡值
+    - `768`：拍摄条件较好时可试，仍在低密度布局的建议范围内
+    - `960`：偏激进，视频更短，但更容易拍屏失败
+    - `1032`：当前默认格式极限值，更适合系统录屏或非常稳定的拍摄环境
 
 - `--repeat`
   - 含义：整轮分片重复播放的次数
@@ -109,13 +112,17 @@ python -m screenfile encode ./input.bin ./transfer.mp4 --yes
 - `--fps`
   - 含义：输出视频帧率
   - 默认值：`8`
-  - 推荐范围：`6` 到 `12`
-  - 推荐起点：`8`
+  - 黑白矩阵推荐范围：`6` 到 `12`
+  - 彩色模式推荐范围：`30` 到 `60`
+  - 黑白矩阵推荐起点：`8`
+  - 彩色模式推荐起点：`60`
   - 使用建议：
-    - `6`：更保守，更稳
-    - `8`：默认平衡值
-    - `10`：想进一步缩短时长时可试
-    - `12`：偏激进，拍屏环境不好时更容易掉帧或模糊
+    - `6`：黑白矩阵更保守，更稳
+    - `8`：黑白矩阵默认平衡值
+    - `10` 到 `12`：黑白矩阵想进一步缩短时长时可试
+    - `30`：彩色模式较稳，但视频更长
+    - `60`：彩色模式推荐值，手机通常会以 60fps 或 120fps 录到足够多的重复帧
+    - 更高 fps 不一定更好，可能让播放端/录制端产生更多压缩和滚动快门问题
 
 - `--compression`
   - 含义：视频分片前先对原文件做的预压缩算法
@@ -127,6 +134,19 @@ python -m screenfile encode ./input.bin ./transfer.mp4 --yes
     - `gzip`：兼容型备选，通常不如 `zstd`
     - `none`：仅在文件本身已高度压缩、或你想做最原始对比时使用
 
+- `--mode`
+  - 含义：视觉编码模式
+  - 默认值：`matrix`
+  - 可选值：`matrix`、`color`
+  - 使用建议：
+    - `matrix`：默认黑白矩阵模式，兼容当前最完整的定位和纠错逻辑
+    - `color`：彩色 4 色模式，每个单元承载 2 bit；单元更大，适合提高单帧数据量，但对屏幕色彩、反光和相机压缩更敏感
+  - 彩色模式建议：
+    - 推荐搭配 `--chunk-size 768 --repeat 3 --fps 60 --compression none`
+    - 如果拍屏环境不稳定，可以降到 `--chunk-size 640` 或把 `--repeat` 提到 `4`
+    - 如果文件本身可压缩，仍可以试 `--compression zstd`
+    - 如果文件本身已经是 zip/mp4/png 等高度压缩格式，`--compression none` 更利于估算和调试
+
 - `-y` / `--yes`
   - 含义：跳过“先评估再确认”的交互步骤，直接生成视频
   - 默认值：关闭
@@ -135,7 +155,7 @@ python -m screenfile encode ./input.bin ./transfer.mp4 --yes
 帧内辅助标记：
 
 - 左上角
-  - 内容：`screenfile <version> layout=v1`
+  - 内容：`screenfile <version> layout=v3`
   - 作用：方便确认编码器版本和帧布局是否一致
 - 右上角
   - 内容：`chunk x/y`
@@ -143,16 +163,28 @@ python -m screenfile encode ./input.bin ./transfer.mp4 --yes
 - 布局原则
   - 这两块信息都放在码框外侧留白区，默认不会压到主体码区
 
+帧布局：
+- 默认使用 `layout=v3`
+- `layout=v3` 会把码区扩展到约 90% 屏幕宽度，使用 `144x72` 的低密度横向矩形数据网格
+- 相比 `layout=v2` 的 `160x80` 网格，v3 的单格更大，牺牲一部分单帧极限容量，换取更稳定的手机拍屏识别
+- 彩色模式使用 `color-v1`，数据网格为 `96x54`，每个单元使用 4 种高对比颜色承载 2 bit，单元尺寸为 `16px`
+- `color-v1` 当前仍属于实验模式：实测已经可以从 iPhone 拍屏视频恢复文件，但解码速度和候选识别仍在优化中
+- 解码端仍会尝试读取旧的 `layout=v2` 和 `layout=v1` 视频
+
 #### `encode` 推荐配置
 
 按拍摄稳定性从稳到快，大致可以这样用：
 
 - 稳妥首选
-  - `--chunk-size 640 --repeat 3 --fps 8 --compression zstd`
+  - `--chunk-size 512 --repeat 4 --fps 6 --compression zstd`
 - 推荐平衡值
-  - `--chunk-size 768 --repeat 2 --fps 8 --compression zstd`
+  - `--chunk-size 640 --repeat 3 --fps 8 --compression zstd`
 - 偏激进缩时长
-  - `--chunk-size 896 --repeat 2 --fps 10 --compression zstd`
+  - `--chunk-size 768 --repeat 3 --fps 8 --compression zstd`
+- 彩色模式试验
+  - `--mode color --chunk-size 768 --repeat 3 --fps 60 --compression none`
+- 彩色模式更稳一点
+  - `--mode color --chunk-size 640 --repeat 4 --fps 60 --compression none`
 
 编码时会输出：
 - 压缩算法
@@ -171,8 +203,11 @@ python -m screenfile encode ./input.bin ./transfer.mp4 --yes
 当前版本补充说明：
 - 新增帧级 Reed-Solomon 纠错，对少量局部误码更稳
 - 预计视频大小改成基于多帧真实内容采样，结果比旧版更接近真实输出
+- 新增彩色 `color-v1` 模式，单个色块承载 2 bit，目标是在不继续缩小单元格的情况下提高单帧数据量
+- 解码端新增彩色采样偏移/缩放变体，用来兼容手机拍屏后的轻微透视误差、码区裁切偏差和网格错位
+- 解码端新增 bit voting 和 temporal bit voting，遇到多帧重复但单帧 CRC 失败时，会尝试用多帧投票补回 packet
 
-### 3. 先做参数评估
+### 2. 先做参数评估
 
 如果你想在真正生成视频前先对比 `none/gzip/zstd` 三种模式的预计效果：
 
@@ -186,7 +221,8 @@ python -m screenfile estimate ./input.bin
 python -m screenfile estimate ./input.bin \
   --chunk-size 768 \
   --repeat 2 \
-  --fps 10
+  --fps 10 \
+  --mode color
 ```
 
 #### `estimate` 入参说明
@@ -198,7 +234,8 @@ python -m screenfile estimate ./input.bin \
 - `--chunk-size`
   - 含义：用于估算的视频分片大小
   - 默认值：`640`
-  - 推荐范围：`640` 到 `896`
+  - 当前上限：`1032`
+  - 推荐范围：`512` 到 `768`
 
 - `--repeat`
   - 含义：用于估算的重复轮数
@@ -208,7 +245,13 @@ python -m screenfile estimate ./input.bin \
 - `--fps`
   - 含义：用于估算的目标视频帧率
   - 默认值：`8`
-  - 推荐范围：`6` 到 `12`
+  - 黑白矩阵推荐范围：`6` 到 `12`
+  - 彩色模式推荐范围：`30` 到 `60`
+
+- `--mode`
+  - 含义：用于估算的视觉编码模式
+  - 默认值：`matrix`
+  - 可选值：`matrix`、`color`
 
 它会分别输出每种压缩模式下的：
 - 原文件大小
@@ -225,10 +268,24 @@ python -m screenfile estimate ./input.bin \
 - `encode` 会按你的实际输出后缀来估算；`estimate` 当前按 `.mp4` 口径估算
 - 这是近似值；不同平台和不同 OpenCV/系统编解码后端之间仍可能有明显差异，Windows 上尤其可能偏大
 
-### 2. 从录下来的视频恢复文件
+### 3. 从录下来的视频恢复文件
 
 ```bash
 python -m screenfile decode ./transfer.mp4 ./restored.bin
+```
+
+如果想手动控制并行解码线程数：
+
+```bash
+python -m screenfile decode ./transfer.mp4 ./restored.bin --workers 8
+```
+
+如果要导出失败帧诊断图：
+
+```bash
+python -m screenfile decode ./transfer.mp4 ./restored.bin \
+  --debug-dir ./debug-frames \
+  --debug-limit 12
 ```
 
 也可以查看当前程序版本：
@@ -247,15 +304,52 @@ python -m screenfile --version
   - 含义：恢复出的目标文件路径
   - 默认值：无，必填
 
+- `--workers`
+  - 含义：并行解码视频帧的 worker 数量
+  - 默认值：自动，最多使用 `8` 个 worker
+  - 推荐范围：`4` 到 `10`
+  - 使用建议：CPU 核心多时可以提高；如果机器发热或占用太高，可以手动降到 `4`
+  - 说明：worker 数量只影响逐帧识别并行度，不会改变解码结果
+
+- `--debug-dir`
+  - 含义：把失败帧的原图、码区裁剪图和二值化图写到指定目录
+  - 默认值：关闭
+  - 使用建议：只在排查解码失败时开启
+
+- `--debug-limit`
+  - 含义：最多导出多少个失败帧样本
+  - 默认值：`12`
+  - 推荐范围：`8` 到 `30`
+  - 使用建议：排查普通失败时 `12` 足够；需要观察更多时间点时可提高
+
 解码时会输出：
 - 已恢复的唯一分片数
 - 扫描帧数
+- 彩色快速路径采样帧数
 - 重复分片数
 - 未识别四边形帧数
 - 帧级 CRC 失败数
 - 数据包解析失败数
+- bit voting 额外恢复的分片数
+- 自动检测到的有效数据帧区间
 
 如果分片没有收齐，程序会直接报错并指出缺失区间，不会写出损坏文件。
+
+当前解码能力：
+- 支持 `.mp4`、`.mov` 等 OpenCV 能读取的视频容器，实际取决于本机 OpenCV/系统解码器
+- 支持视频前后包含无关画面，会根据有效 packet 自动判断数据区间
+- 支持非全屏拍摄，会自动在画面中寻找码区并做透视校正
+- 支持轻微歪斜、缩放、亮度变化和部分采样偏移
+- 支持旧版 `layout=v1`、`layout=v2`、当前默认 `layout=v3` 和实验性 `color-v1`
+- 对彩色视频，会额外尝试小范围数据网格偏移/缩放，改善手机拍屏造成的采样错位
+- 对彩色视频，会优先尝试 fast color decode：先找首个有效 packet，再按总 chunk 数预测每个 chunk 的时间位置，只采样关键帧和邻近偏移帧，成功时不再做慢速全帧扫描
+- 对重复帧，会尝试 bit voting 和 temporal bit voting，减少单帧局部误码导致的失败
+
+当前限制：
+- 如果码区被浮层、宠物、反光或窗口遮挡到实际数据区域，仍可能无法恢复
+- 彩色模式解码仍比黑白模式慢，尤其是手机拍屏视频需要尝试多个候选区域时
+- fast color decode 依赖“chunk 基本按顺序播放、每个 chunk 连续重复”的当前编码策略；如果视频被剪辑、变速或严重丢帧，可能会 fallback 到慢速扫描
+- 实测中，一个 `460KB`、`614` 个 chunk、约 `32s` 的彩色 iPhone 拍屏视频已经可以完整恢复；更大文件仍建议先用小样本验证拍摄环境
 
 ## Demo 脚本
 
@@ -393,9 +487,14 @@ dist\screenfile.exe
 - 上传产物为 GitHub Actions artifacts
 
 产物名称：
-- `screenfile-linux-x64.zip`
-- `screenfile-macos.zip`
-- `screenfile-windows-x64.zip`
+- `screenfile-v0.3.0-linux-x64.zip`
+- `screenfile-v0.3.0-macos-arm64.zip`
+- `screenfile-v0.3.0-windows-x64.zip`
+
+命名规则：
+- `screenfile-v<version>-<os>-<arch>.zip`
+- 其中 `<version>` 来自当前项目版本号或 release tag，例如 `v0.3.0`
+- `<arch>` 当前默认是 `linux-x64`、`macos-arm64`、`windows-x64`
 
 注意：
 - 这是“同一仓库自动构建全平台产物”，不是“单台 mac 直接本地交叉编译所有平台”。
@@ -435,17 +534,27 @@ dist\screenfile.exe
 每一帧包含：
 - 外层黑色边框
 - 四角定位标记
-- 中央黑白网格数据区
+- 中央数据网格区，黑白模式为二值矩阵，彩色模式为 4 色矩阵
 - 帧内可见分片序号文本
 
 解码流程：
 1. 从视频读取一帧
-2. 找到最大四边形候选区域
+2. 自动寻找可能的码区四边形候选区域
 3. 做透视校正
-4. 二值化并按网格采样
+4. 按布局采样；黑白模式做二值化，彩色模式做颜色分类并尝试小范围采样偏移
 5. 还原数据包并校验 CRC
-6. 按分片序号去重
-7. 分片收齐后重组并校验 SHA-256
+6. 对重复帧和失败帧尝试 bit voting / temporal bit voting
+7. 按分片序号去重
+8. 分片收齐后重组并校验 SHA-256
+
+彩色快速解码流程：
+1. 先从视频开头少量帧里寻找首个有效 `color-v1` packet
+2. 读取 packet 里的 `total_chunks`
+3. 根据总帧数和 chunk 数预测每个 chunk 的中心帧
+4. 对每个中心帧额外取 `-2/+2/-4/+4/-8/+8` 等偏移帧
+5. 每帧只尝试少量最像 `color-v1` 码区的候选区域
+6. 如果全部 chunk 收齐，直接写出恢复文件
+7. 如果没收齐，再回退到完整逐帧扫描和投票恢复
 
 在进入视频分片前，当前版本会先把原始文件包装成一个传输 payload，其中包含：
 - 原始文件名
@@ -469,6 +578,8 @@ dist\screenfile.exe
 - 避免强反光
 - 让编码区域完整入镜
 - 尽量保持对焦稳定
+- 彩色模式下尽量避免开启会改变颜色的护眼模式、夜览模式或过强 HDR 显示效果
+- 如果使用 iPhone 拍摄，`60fps` 输出通常可以被稳定记录；部分场景下视频元数据可能显示接近 `120fps`，这是正常的高帧率录制结果
 
 ## 已知边界
 
@@ -477,15 +588,16 @@ dist\screenfile.exe
 当前不包含：
 - 音频通道传输
 - 多区域并行编码
-- 真正的前向纠错库集成
+- 跨 chunk 的前向纠错
 - 多视频合并补片
 - 图形界面
 
 如果目标是更大的文件或更短的视频时长，下一步通常会做：
 - 更高密度但仍可拍摄的码型
-- 前向纠错
+- 跨 chunk 前向纠错
 - 更智能的重排与重复策略
 - 多区域并行传输
+- 进一步优化 fast color decode，减少大文件彩色视频的解码时间
 
 ## 测试
 
@@ -503,5 +615,8 @@ python -m unittest discover -s tests -v
 - 轻度与更强的拍屏式图像劣化
 - 视频端到端恢复
 - 丢帧导致的缺片失败路径
+- 彩色 `color-v1` 帧编码/解码
+- 彩色网格偏移解码
+- bit voting 与 temporal bit voting
 - demo 脚本端到端生成与恢复
 - CLI 显式 argv 调用

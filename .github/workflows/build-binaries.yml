@@ -8,20 +8,23 @@ on:
 
 jobs:
   build:
-    name: Build ${{ matrix.artifact_name }}
+    name: Build ${{ matrix.os_name }}-${{ matrix.cpu_arch }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            artifact_name: screenfile-linux-x64.zip
+            os_name: linux
+            cpu_arch: x64
             executable_path: dist/screenfile
           - os: macos-latest
-            artifact_name: screenfile-macos.zip
+            os_name: macos
+            cpu_arch: arm64
             executable_path: dist/screenfile
           - os: windows-latest
-            artifact_name: screenfile-windows-x64.zip
+            os_name: windows
+            cpu_arch: x64
             executable_path: dist/screenfile.exe
 
     steps:
@@ -36,6 +39,14 @@ jobs:
       - name: Install package with build extras
         run: python -m pip install -e ".[build]"
 
+      - name: Resolve artifact name
+        shell: bash
+        run: |
+          version="v$(python -c 'import screenfile; print(screenfile.__version__)')"
+          artifact_name="screenfile-${version}-${{ matrix.os_name }}-${{ matrix.cpu_arch }}.zip"
+          echo "SCREENFILE_VERSION=${version}" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=${artifact_name}" >> "$GITHUB_ENV"
+
       - name: Run tests
         run: python -m unittest discover -s tests -v
 
@@ -43,11 +54,11 @@ jobs:
         run: python scripts/build_executable.py
 
       - name: Package executable
-        run: python scripts/package_artifact.py "${{ matrix.executable_path }}" "dist/${{ matrix.artifact_name }}"
+        run: python scripts/package_artifact.py "${{ matrix.executable_path }}" "dist/${{ env.ARTIFACT_NAME }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: dist/${{ matrix.artifact_name }}
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/${{ env.ARTIFACT_NAME }}
           if-no-files-found: error
